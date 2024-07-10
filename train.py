@@ -80,7 +80,6 @@ def validate(
         accelerator: Accelerator,
 ) -> float:
     """Evaluate model on validation data and save checkpoint if loss improves"""
-    is_main = accelerator.is_main_process
     dtype = {"no": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[accelerator.mixed_precision]
     model_to_eval = ema_model if ema_model is not None else model
     model_to_eval.eval()
@@ -89,33 +88,26 @@ def validate(
     val_id = pbar.add_task("Validating", visible=True, total=cfg.val_repeats * max_steps, transient=True, loss=math.nan)
 
     loss, count = 0.0, 0
-
     for i in range(cfg.val_repeats):
         for idx, eval_batch in enumerate(val_dataloader):
-            if is_main:
-                enabled = True if dtype in [torch.float16, torch.bfloat16] else False
-                with torch.inference_mode(), torch.amp.autocast('cuda', dtype=dtype, enabled=enabled):
-                    loss += model_to_eval(eval_batch.to(accelerator.device)).item()
-                    count += 1
-                pbar.update(val_id, advance=1, loss=loss / count)
-
-            accelerator.wait_for_everyone()
+            enabled = True if dtype in [torch.float16, torch.bfloat16] else False
+            with torch.inference_mode(), torch.cuda.amp.autocast(dtype=dtype, enabled=enabled):
+                loss += model_to_eval(eval_batch.to(accelerator.device)).item()
+                count += 1
+            pbar.update(val_id, advance=1, loss=loss / count)
             if (idx + 1) >= max_steps:
                 break
-    if is_main:
-        loss /= count
+    loss /= count
+    pbar.remove_task(val_id)
+    log(run["metrics"]["val"]["loss"], loss, step)
 
-        pbar.remove_task(val_id)
-        log(run["metrics"]["val"]["loss"], loss, step)
-
-        if checkpoint_root_dir is not None and (loss < best_val_loss or math.isinf(best_val_loss)):
-            logger.info(f"loss improved: new value is {loss}")
-            step_checkpoint_path = checkpoint_root_dir / "best"
-            run_id = "BFN" if isinstance(run, defaultdict) else run["sys"]["id"].fetch()
-            checkpoint_training_state(step_checkpoint_path, accelerator, ema_model, step, run_id)
-            run["metrics/best/loss/metric"] = loss
-            run["metrics/best/loss/step"] = step
-
+    if checkpoint_root_dir is not None and (loss < best_val_loss or math.isinf(best_val_loss)):
+        logger.info(f"loss improved: new value is {loss}")
+        step_checkpoint_path = checkpoint_root_dir / "best"
+        run_id = "BFN" if isinstance(run, defaultdict) else run["sys"]["id"].fetch()
+        checkpoint_training_state(step_checkpoint_path, accelerator, ema_model, step, run_id)
+        run["metrics/best/loss/metric"] = loss
+        run["metrics/best/loss/step"] = step
 
     model.train()
     return loss
@@ -165,7 +157,7 @@ def train(
             log(run["metrics"]["train"]["loss"], step_loss / cfg.accumulate, step, is_main and step % cfg.log_interval == 0)
             log(run["metrics"]["epoch"], step // len(dataloaders["train"]), step, is_main)
 
-            if (step % cfg.val_interval == 0) and "val" in dataloaders:
+            if is_main and (step % cfg.val_interval == 0) and "val" in dataloaders:
                 val_loss = validate(
                     cfg=cfg,
                     model=accelerator.unwrap_model(model),
